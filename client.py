@@ -3,11 +3,45 @@ import sounddevice as sd
 import struct
 import argparse
 import os
+import re
+import queue
+import threading
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
-class GeminiClient:
+# ‼️ New class to handle sentence extraction from a continuous stream
+class StreamSentenceSplitter:
+    def __init__(self):
+        self.buffer = ""
+        # Regex to split on punctuation followed by whitespace (looks ahead)
+        self.split_pattern = r'(?<=[.!?])\s+'
+
+    def process_chunk(self, text_chunk):
+        """Returns a list of complete sentences found in the chunk (plus buffer)."""
+        self.buffer += text_chunk
+        
+        # Try to split
+        parts = re.split(self.split_pattern, self.buffer)
+        
+        if len(parts) > 1:
+            # We have at least one split. 
+            # All parts except the last one are definitely complete sentences.
+            complete_sentences = parts[:-1]
+            # The last part is the new buffer (might be incomplete)
+            self.buffer = parts[-1]
+            return complete_sentences
+        else:
+            return []
+
+    def flush(self):
+        """Returns any remaining text in the buffer."""
+        res = self.buffer.strip()
+        self.buffer = ""
+        return [res] if res else []
+
+# ‼️ New class to manage the Gemini Connection
+class GeminiStreamer:
     def __init__(self):
         load_dotenv()
         self.api_key = os.getenv("GOOGLE_API_KEY")
@@ -17,21 +51,18 @@ class GeminiClient:
         else:
             self.client = genai.Client(api_key=self.api_key)
 
-    def generate_text(self, prompt, system_instruction=None):
+    def stream_text_generator(self, prompt, system_instruction=None):
         if not self.client:
-            return None
-        
+            return
+
         config = None
         if system_instruction:
             config = types.GenerateContentConfig(
                 system_instruction=system_instruction
             )
         
-        print(f"\n>> Gemini Streaming Response:", flush=True)
-        full_text = ""
-        
+        print(f"\n>> Gemini Streaming Request Sent...", flush=True)
         try:
-
             response = self.client.models.generate_content_stream(
                 model="gemini-2.0-flash",
                 contents=prompt,
@@ -40,148 +71,218 @@ class GeminiClient:
             
             for chunk in response:
                 if chunk.text:
-                    print(chunk.text, end="", flush=True)
-                    full_text += chunk.text
-            
-            print("\n") # Newline after stream finishes
-            return full_text
-            
+                    yield chunk.text
+                    
         except Exception as e:
             print(f"\n‼️ Gemini Error: {e}")
-            return None
 
-class TTSClient:
-    def __init__(self, server_url="http://localhost:8123/tts"):
+# ‼️ Completely refactored Audio Pipeline
+class AudioPipeline:
+    def __init__(self, server_url, voice=None, temp=0.9):
         self.server_url = server_url
+        self.voice = voice
+        self.temp = temp
+        
+        # Queues for the pipeline
+        self.sentence_queue = queue.Queue() # Text sentences waiting for TTS
+        self.audio_chunk_queue = queue.Queue() # Audio bytes waiting for playback
+        
+        # Control flags
+        self.playback_finished = threading.Event()
+        self.tts_processing_finished = threading.Event()
+        self.stop_signal = False
+
+        # Audio Config
         self.sample_rate = None
-        self.header_size = 0
+        self.channels = 1
+        self.sd_stream = None
 
     def _parse_wav_header(self, header_bytes):
-        """
-        Parses the WAV header to extract sample rate and finding the start of data.
-        Returns (sample_rate, data_start_offset)
-        """
+        """Parses WAV header to get sample rate and data offset."""
         try:
-            if header_bytes[0:4] != b'RIFF':
+            if len(header_bytes) < 44 or header_bytes[0:4] != b'RIFF':
                 return None, 0
             
             fmt_loc = header_bytes.find(b'fmt ')
-            if fmt_loc == -1: 
-                return None, 0
-                
+            if fmt_loc == -1: return None, 0
+            
             sr_offset = fmt_loc + 12
             sample_rate = struct.unpack('<I', header_bytes[sr_offset:sr_offset+4])[0]
             
             data_loc = header_bytes.find(b'data')
-            if data_loc == -1:
-                return sample_rate, 44
-                
-            header_size = data_loc + 8 
+            if data_loc == -1: return sample_rate, 44
             
+            header_size = data_loc + 8 
             return sample_rate, header_size
-        except Exception as e:
-            print(f"Header parse warning: {e}")
+        except:
             return None, 0
 
-    def stream_audio(self, text, voice=None, temperature=0.9):
-        payload = {
-            "text": text,
-            "temperature": temperature
-        }
-        
-        if voice:
-            payload["voice"] = voice
+    def tts_worker(self):
+        """Thread: Pops sentences, requests TTS, pushes audio chunks."""
+        while not self.stop_signal:
+            try:
+                # Wait for a sentence (timeout allows checking stop_signal)
+                text = self.sentence_queue.get(timeout=0.5)
+                if text is None: # Sentinel value
+                    break
+            except queue.Empty:
+                continue
 
-        print(f" >> Sending to TTS (Temp: {temperature}, Voice: {voice or 'Default'}): {text[:50]}...", flush=True)
+            print(f"   [TTS Worker] Processing: '{text[:30]}...'", flush=True)
+            
+            payload = {
+                "text": text,
+                "temperature": self.temp,
+                "voice": self.voice
+            }
 
-        try:
-            with requests.post(self.server_url, json=payload, stream=True, timeout=10) as response:
-                if response.status_code != 200:
-                    print(f"Server Error: {response.status_code}")
-                    return
-
-                output_stream = None
-                first_chunk_buffer = b""
-                is_header_processed = False
-
-                print(" >> Connected to TTS. Waiting for audio...", flush=True)
-
-                for chunk in response.iter_content(chunk_size=1024):
-                    if not chunk:
+            try:
+                # ‼️ Send request to server (streaming response)
+                with requests.post(self.server_url, json=payload, stream=True, timeout=30) as response:
+                    if response.status_code != 200:
+                        print(f"‼️ Server Error {response.status_code}")
                         continue
+                    
+                    for chunk in response.iter_content(chunk_size=4096):
+                        if chunk:
+                            self.audio_chunk_queue.put(chunk)
+            except Exception as e:
+                print(f"‼️ TTS Network Error: {e}")
 
-                    if not is_header_processed:
-                        first_chunk_buffer += chunk
-                        # Wait for minimal header size
-                        if len(first_chunk_buffer) < 44:
-                            continue
-                        
-                        sr, header_len = self._parse_wav_header(first_chunk_buffer)
-                        
-                        if not sr:
-                            print("Could not detect WAV header. Aborting.")
-                            return
+            self.sentence_queue.task_done()
+        
+        # Signal that no more audio will be produced
+        self.tts_processing_finished.set()
+        self.audio_chunk_queue.put(None) # Sentinel for player
 
-                        print(f" >> Stream started. Rate: {sr}Hz", flush=True)
-                        
-                        output_stream = sd.RawOutputStream(
-                            samplerate=sr,
-                            channels=1,
-                            dtype='int16', 
-                            blocksize=1024
-                        )
-                        output_stream.start()
+    def player_worker(self):
+        """Thread: Pops audio chunks, plays continuous stream."""
+        buffer = b""
+        stream_open = False
+        
+        while not self.stop_signal:
+            try:
+                chunk = self.audio_chunk_queue.get(timeout=0.5)
+                if chunk is None: # Sentinel
+                    break
+            except queue.Empty:
+                continue
 
-                        # Write the data part of the buffer (skipping header)
-                        output_stream.write(first_chunk_buffer[header_len:])
-                        
-                        is_header_processed = True
+            if not stream_open:
+                buffer += chunk
+                # Need enough bytes for header
+                if len(buffer) < 44:
+                    continue
+                
+                # Parse header
+                sr, header_len = self._parse_wav_header(buffer)
+                if sr:
+                    self.sample_rate = sr
+                    print(f"   [Player] Stream started at {sr}Hz", flush=True)
+                    
+                    self.sd_stream = sd.RawOutputStream(
+                        samplerate=self.sample_rate,
+                        channels=self.channels,
+                        dtype='int16', 
+                        blocksize=2048
+                    )
+                    self.sd_stream.start()
+                    
+                    # Write initial data (skipping header)
+                    self.sd_stream.write(buffer[header_len:])
+                    buffer = b"" # Clear buffer
+                    stream_open = True
+                else:
+                    # If we can't find header yet, keep buffering
+                    continue
+            else:
+                # ‼️ Crucial: For subsequent sentences, we might get a WAV header again 
+                # (because server treats each request as new). We must detect and strip it
+                # to avoid loud "pops" or static.
+                
+                # Simple heuristic: Check if chunk starts with RIFF
+                if chunk.startswith(b'RIFF'):
+                    _, h_len = self._parse_wav_header(chunk)
+                    if h_len > 0:
+                        # Strip the header, play the rest
+                        self.sd_stream.write(chunk[h_len:])
                     else:
-                        output_stream.write(chunk)
+                        self.sd_stream.write(chunk)
+                else:
+                    self.sd_stream.write(chunk)
 
-                if output_stream:
-                    print(" >> Playback finished.", flush=True)
-                    output_stream.stop()
-                    output_stream.close()
+            self.audio_chunk_queue.task_done()
 
-        except requests.exceptions.Timeout:
-            print("Error: Server connection timed out. The model might be stuck generating.")
-        except requests.exceptions.ConnectionError:
-            print("Could not connect to server. Is it running?")
-        except KeyboardInterrupt:
-            print("\nStopped.")
-        except Exception as e:
-            print(f"Error: {e}")
+        if self.sd_stream:
+            self.sd_stream.stop()
+            self.sd_stream.close()
+        self.playback_finished.set()
+
+    def start(self):
+        self.t_tts = threading.Thread(target=self.tts_worker, daemon=True)
+        self.t_player = threading.Thread(target=self.player_worker, daemon=True)
+        self.t_tts.start()
+        self.t_player.start()
+
+    def add_text(self, text):
+        self.sentence_queue.put(text)
+
+    def close(self):
+        self.sentence_queue.put(None) # Stop TTS
+        self.t_tts.join() # Wait for TTS to finish pending
+        self.t_player.join() # Wait for player to finish pending
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="TTS Streaming Client with Gemini Integration")
-    parser.add_argument("text", nargs="?", help="Text to speak OR Prompt for Gemini")
-    parser.add_argument("--url", default="http://localhost:8123/tts", help="Server URL")
-    parser.add_argument("--temp", type=float, default=0.9, help="Temperature (creativity)")
-    parser.add_argument("--voice", type=str, default=None, help="Voice ID (filename in refs/ without extension)")
-
-    parser.add_argument("--gemini", action="store_true", help="Use text argument as a prompt for Gemini")
+    parser = argparse.ArgumentParser(description="Streaming Pipeline: Gemini -> TTS -> Audio")
+    parser.add_argument("text", nargs="?", help="Initial prompt for Gemini")
+    parser.add_argument("--url", default="http://localhost:8123/tts", help="TTS Server URL")
+    parser.add_argument("--temp", type=float, default=0.9, help="Audio Temperature")
+    parser.add_argument("--voice", type=str, default=None, help="Voice ID")
+    parser.add_argument("--gemini", action="store_true", help="Treat input as Gemini Prompt")
     
     args = parser.parse_args()
 
+    pipeline = AudioPipeline(args.url, args.voice, args.temp)
+    pipeline.start()
 
-    text_to_process = args.text
-    
-    if args.gemini and args.text:
-        gemini = GeminiClient()
-        sys_instruction = "You are a chat assistant. You are concise with your answers"
+    try:
+        if args.gemini and args.text:
+            gemini = GeminiStreamer()
+            splitter = StreamSentenceSplitter()
+            sys_prompt = "You are a conversational assistant. You give lengthy responses."
+            
+            print(f">> Prompting Gemini: {args.text}")
+            
+            # ‼️ Main Loop: Stream Gemini -> Split -> Push to Pipeline
+            for text_chunk in gemini.stream_text_generator(args.text, system_instruction=sys_prompt):
+                print(text_chunk, end="", flush=True) # Print text as it arrives
+                sentences = splitter.process_chunk(text_chunk)
+                for s in sentences:
+                    pipeline.add_text(s)
+            
+            # Flush remainder
+            for s in splitter.flush():
+                pipeline.add_text(s)
+                
+            print("\n>> Gemini Stream Finished. Waiting for audio...")
 
-        text_to_process = gemini.generate_text(args.text, system_instruction=sys_instruction)
+        elif args.text:
+            # Direct text mode (simulating streaming by just pushing it)
+            pipeline.add_text(args.text)
+        else:
+            # Test mode
+            test_sentences = [
+                "This is the first sentence to test the pipeline.",
+                "Here comes the second sentence, which should play immediately after.",
+                "Finally, a third sentence to ensure buffering works correctly."
+            ]
+            for s in test_sentences:
+                pipeline.add_text(s)
 
-    client = TTSClient(server_url=args.url)
+        pipeline.close()
+        print(">> Done.")
 
-    if text_to_process:
-        client.stream_audio(text_to_process, voice=args.voice, temperature=args.temp)
-    elif not args.gemini: 
-        # Default test text (only if no text and no gemini flag provided)
-        long_text = (
-            "Here is a more comprehensive test to verify the streaming capabilities of your server. "
-            "We are sending a significantly larger block of text to ensure that the sentence splitting logic works seamlessly. "
-            "By the time you hear this sentence, the GPU should have already finished processing the beginning."
-        )
-        client.stream_audio(long_text, voice=args.voice, temperature=args.temp)
+    except KeyboardInterrupt:
+        print("\nStopping...")
+        pipeline.stop_signal = True
+        pipeline.close()
