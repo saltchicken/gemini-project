@@ -141,6 +141,7 @@ class GeminiCanvasClient:
         else:
             self.client = genai.Client(api_key=self.api_key)
 
+        # ‼️ Updated system prompt to handle file moves/deletions via chat notes
         self.system_prompt = """
         You are an expert coding assistant simulating a 'Canvas' interface.
         
@@ -153,6 +154,7 @@ class GeminiCanvasClient:
         2. STRICTLY FORBIDDEN: Do NOT use markdown code blocks (```) or (```xml). Just write the XML tags directly.
         3. You can generate multiple files in one response.
         4. Provide brief explanations outside the file tags.
+        5. If the user asks to move files, generate the file in the new path. Since you cannot delete files, explicitly mention in the chat which old files the user should consider deleting.
         """
 
     def stream_content(self, user_prompt):
