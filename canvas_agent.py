@@ -2,6 +2,7 @@ import os
 import re
 import argparse
 import sys
+import datetime # ‼️ Added to support timestamping folders
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -20,6 +21,12 @@ class CanvasStreamParser:
         # ‼️ Regex to detect the custom file tags (handles " or ' quotes)
         self.open_tag_pattern = re.compile(r'<file\s+path=["\']([^"\']+)["\']\s*>', re.DOTALL)
         self.close_tag_pattern = re.compile(r'</file>', re.DOTALL)
+
+    # ‼️ Added helper to clean artifact markdown fences from chat
+    def _clean_chat(self, text):
+        # Removes standalone ``` or ```xml that might appear as artifacts
+        cleaned = re.sub(r'^\s*```\w*\s*$', '', text, flags=re.MULTILINE)
+        return cleaned
 
     def process_chunk(self, chunk):
         """
@@ -40,8 +47,11 @@ class CanvasStreamParser:
                     # ‼️ Found a file start tag
                     # 1. Everything before the tag is chat
                     pre_text = self.buffer[:match.start()]
-                    if pre_text:
-                        events.append(('chat', pre_text))
+                    
+                    # ‼️ Filter out markdown fences if they appear in chat
+                    clean_text = self._clean_chat(pre_text)
+                    if clean_text:
+                        events.append(('chat', clean_text))
                     
                     # 2. Switch state
                     self.in_file = True
@@ -58,14 +68,20 @@ class CanvasStreamParser:
                     if tag_start != -1:
                         # Flush everything before the potential tag as chat
                         if tag_start > 0:
-                            events.append(('chat', self.buffer[:tag_start]))
+                            # ‼️ Clean chat before appending
+                            clean_text = self._clean_chat(self.buffer[:tag_start])
+                            if clean_text:
+                                events.append(('chat', clean_text))
                             self.buffer = self.buffer[tag_start:]
                         # Keep the rest in buffer and wait for next chunk
                         break 
                     else:
                         # No potential tag start, flush everything as chat
                         if self.buffer:
-                            events.append(('chat', self.buffer))
+                            # ‼️ Clean chat before appending
+                            clean_text = self._clean_chat(self.buffer)
+                            if clean_text:
+                                events.append(('chat', clean_text))
                             self.buffer = ""
                         break
 
@@ -109,7 +125,10 @@ class CanvasStreamParser:
     def flush(self):
         """Returns any remaining text in buffer as chat."""
         if self.buffer and not self.in_file:
-            return [('chat', self.buffer)]
+            # ‼️ Clean chat on flush
+            clean_text = self._clean_chat(self.buffer)
+            if clean_text:
+                return [('chat', clean_text)]
         return []
 
 # ‼️ New class to interact with Gemini using the requested system instruction
@@ -124,6 +143,7 @@ class GeminiCanvasClient:
             self.client = genai.Client(api_key=self.api_key)
         
         # ‼️ System prompt to enforce the XML format structure
+        # ‼️ Strengthened rule #2 to explicitly forbid ```xml
         self.system_prompt = """
         You are an expert coding assistant simulating a 'Canvas' interface.
         
@@ -133,7 +153,7 @@ class GeminiCanvasClient:
            ... code content ...
            </file>
         
-        2. Do NOT use markdown code blocks (```) for files you want to save.
+        2. STRICTLY FORBIDDEN: Do NOT use markdown code blocks (```) or (```xml). Just write the XML tags directly.
         3. You can generate multiple files in one response.
         4. Provide brief explanations outside the file tags.
         """
@@ -164,24 +184,36 @@ class GeminiCanvasClient:
 def main():
     parser = argparse.ArgumentParser(description="Gemini Canvas Agent")
     parser.add_argument("prompt", help="The coding task description")
-    parser.add_argument("--out-dir", default="./canvas_output", help="Directory to save generated files")
+    # ‼️ Changed default to 'output' to match user request
+    parser.add_argument("--out-dir", default="output", help="Base directory to save generated files")
+    # ‼️ Added --debug flag to print raw output
+    parser.add_argument("--debug", action="store_true", help="Print raw stream output for debugging")
     args = parser.parse_args()
 
+    # ‼️ Generate a unique subfolder name based on timestamp
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    # ‼️ The final directory is now base_dir + timestamp
+    generation_dir = os.path.join(args.out_dir, timestamp)
+
     # Ensure output directory exists
-    if not os.path.exists(args.out_dir):
-        os.makedirs(args.out_dir)
+    if not os.path.exists(generation_dir):
+        os.makedirs(generation_dir)
 
     client = GeminiCanvasClient()
     stream_parser = CanvasStreamParser()
     
     current_file_handle = None
 
-    print(f"Canvas Agent initialized. Output dir: {args.out_dir}")
+    print(f"Canvas Agent initialized. Output dir: {generation_dir}")
     print(f"Prompt: {args.prompt}\n" + "-"*50)
 
     try:
         # ‼️ Stream from Gemini and parse events simultaneously
         for text_chunk in client.stream_content(args.prompt):
+            # ‼️ If debug is on, print the raw chunk (using repr to show newlines)
+            if args.debug:
+                print(f"\033[90m[RAW]: {repr(text_chunk)}\033[0m")
+
             events = stream_parser.process_chunk(text_chunk)
             
             for event_type, data in events:
@@ -191,8 +223,12 @@ def main():
                     sys.stdout.flush()
                 
                 elif event_type == 'file_start':
-                    # ‼️ Start capturing file content
-                    full_path = os.path.join(args.out_dir, data)
+                    # ‼️ Start capturing file content, using the generation_dir
+                    full_path = os.path.join(generation_dir, data)
+                    
+                    # ‼️ Create subdirectories if the file path contains folders (e.g. css/style.css)
+                    os.makedirs(os.path.dirname(full_path), exist_ok=True)
+                    
                     print(f"\n\n\033[93m[Creating File: {data}]\033[0m", end="") # Yellow text
                     current_file_handle = open(full_path, 'w', encoding='utf-8')
                 
