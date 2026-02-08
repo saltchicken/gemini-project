@@ -3,7 +3,6 @@ import re
 import argparse
 import sys
 import datetime
-import fnmatch  # ‼️ Added for file pattern matching
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -132,52 +131,6 @@ class CanvasStreamParser:
         return []
 
 
-# ‼️ Added helper function to extract project context
-def get_project_context(root_dir):
-    """
-    Walks a directory and returns a formatted XML string of file contents.
-    Skips common ignore directories and binary file types.
-    """
-    context_parts = ["<project_context>"]
-    
-    # ‼️ Default ignore lists
-    ignore_dirs = {
-        ".git", "__pycache__", "venv", "node_modules", ".idea", 
-        ".vscode", "build", "dist", ".ruff_cache", "site-packages"
-    }
-    ignore_files = {
-        "*.pyc", "*.o", "*.exe", "*.dll", ".env", "*.png", "*.jpg", 
-        "*.jpeg", "*.gif", "*.ico", "*.zip", "*.tar.gz", "*.db", "*.sqlite"
-    }
-
-    print(f"Scanning context from: {root_dir}")
-
-    for dirpath, dirnames, filenames in os.walk(root_dir):
-        # Modify dirnames in-place to skip ignored directories
-        dirnames[:] = [d for d in dirnames if d not in ignore_dirs]
-
-        for filename in filenames:
-            if any(fnmatch.fnmatch(filename, pattern) for pattern in ignore_files):
-                continue
-            
-            filepath = os.path.join(dirpath, filename)
-            rel_path = os.path.relpath(filepath, root_dir)
-            
-            try:
-                # Attempt to read as text
-                with open(filepath, "r", encoding="utf-8") as f:
-                    content = f.read()
-                    context_parts.append(f'<file path="{rel_path}">\n{content}\n</file>')
-            except UnicodeDecodeError:
-                # Skip binary files that weren't caught by extension
-                continue
-            except Exception as e:
-                print(f"Skipping {rel_path}: {e}")
-    
-    context_parts.append("</project_context>")
-    return "\n".join(context_parts)
-
-
 class GeminiCanvasClient:
     def __init__(self):
         load_dotenv()
@@ -202,15 +155,9 @@ class GeminiCanvasClient:
         4. Provide brief explanations outside the file tags.
         """
 
-    # ‼️ Updated signature to accept context
-    def stream_content(self, user_prompt, project_context=None):
+    def stream_content(self, user_prompt):
         if not self.client:
             return
-
-        # ‼️ Merge context if provided
-        full_prompt = user_prompt
-        if project_context:
-            full_prompt = f"Here is the project context:\n{project_context}\n\nTask:\n{user_prompt}"
 
         config = types.GenerateContentConfig(
             system_instruction=self.system_prompt,
@@ -220,7 +167,7 @@ class GeminiCanvasClient:
         print("\n>> Requesting Canvas Generation...", flush=True)
         try:
             response = self.client.models.generate_content_stream(
-                model="gemini-2.0-flash", contents=full_prompt, config=config
+                model="gemini-2.0-flash", contents=user_prompt, config=config
             )
 
             for chunk in response:
@@ -230,6 +177,39 @@ class GeminiCanvasClient:
             print(f"\n‼️ API Error: {e}")
 
 
+# ‼️ Extracted helper function to handle context loading
+def load_project_context(directory):
+    """
+    Recursively reads all files in the directory to build a context string.
+    Skips hidden files and binary files.
+    """
+    context_parts = []
+    print(f"\nScanning for context in: {directory}...")
+    
+    for root, dirs, files in os.walk(directory):
+        # Skip hidden directories like .git or .ruff_cache
+        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        
+        for file in files:
+            if file.startswith('.'):
+                continue
+                
+            full_path = os.path.join(root, file)
+            # ‼️ Use relative path so the LLM understands the structure
+            rel_path = os.path.relpath(full_path, directory)
+            
+            try:
+                # Try reading as text; skip if binary/error
+                with open(full_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    context_parts.append(f'<file path="{rel_path}">\n{content}\n</file>')
+            except Exception:
+                # Silently skip non-text files
+                pass
+                
+    return "\n".join(context_parts)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Gemini Canvas Agent")
     parser.add_argument("prompt", help="The coding task description")
@@ -237,17 +217,29 @@ def main():
     parser.add_argument(
         "--out-dir", default="output", help="Base directory to save generated files"
     )
-
-    # ‼️ Added project directory argument
+    
+    # ‼️ Added --project argument
     parser.add_argument(
-        "--project-dir", "-p", help="Directory to ingest for context"
+        "--project", help="Project name. Uses output/PROJECT_NAME and loads context if it exists."
     )
 
     args = parser.parse_args()
 
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    # ‼️ Determine generation directory based on project arg
+    if args.project:
+        generation_dir = os.path.join(args.out_dir, args.project)
+    else:
+        # Default behavior: timestamp
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        generation_dir = os.path.join(args.out_dir, timestamp)
 
-    generation_dir = os.path.join(args.out_dir, timestamp)
+    # ‼️ Load context if project exists
+    context_data = ""
+    if args.project and os.path.exists(generation_dir):
+        print(f"\033[96m[Existing Project Detected]\033[0m", end=" ")
+        context_data = load_project_context(generation_dir)
+        if context_data:
+             print(f"Loaded context ({len(context_data)} chars).")
 
     # Ensure output directory exists
     if not os.path.exists(generation_dir):
@@ -256,24 +248,24 @@ def main():
     client = GeminiCanvasClient()
     stream_parser = CanvasStreamParser()
 
-    # ‼️ Handle context loading
-    context_str = None
-    if args.project_dir:
-        if os.path.exists(args.project_dir):
-            context_str = get_project_context(args.project_dir)
-            print(f"Context loaded ({len(context_str)} chars).")
-        else:
-            print(f"‼️ Warning: Project directory '{args.project_dir}' not found.")
-
     current_file_handle = None
 
     print(f"Canvas Agent initialized. Output dir: {generation_dir}")
     print(f"Prompt: {args.prompt}\n" + "-" * 50)
 
+    # ‼️ Inject context into the prompt
+    final_prompt = args.prompt
+    if context_data:
+        final_prompt = (
+            f"{args.prompt}\n\n"
+            f"Here is the current state of the project:\n"
+            f"{context_data}\n\n"
+            f"Please update or add files as necessary."
+        )
+
     try:
 
-        # ‼️ Pass the context to stream_content
-        for text_chunk in client.stream_content(args.prompt, project_context=context_str):
+        for text_chunk in client.stream_content(final_prompt):
 
             events = stream_parser.process_chunk(text_chunk)
 
